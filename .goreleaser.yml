@@ -1,0 +1,17 @@
+# Build customization
+before:
+  hooks:
+    - go mod download
+    - go mod tidy
+builds:
+  - main: ./cmd/
+    env:
+      - CGO_ENABLED=0
+    binary: kubectl-nginx_ingress_controller_configuration_checker
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+archives:
+  - format: binary
