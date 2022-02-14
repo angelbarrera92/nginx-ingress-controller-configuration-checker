@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
+	"regexp"
 
 	"github.com/angelbarrera92/nginx-ingress-controller-configuration-checker/pkg/kube"
 	"github.com/spf13/cobra"
@@ -88,6 +88,7 @@ func NewCmdNginxIngressControllerChecker(streams genericclioptions.IOStreams) *c
 	}
 	cmd.Flags().StringVarP(&o.container, "container", "c", "", "Container name. If omitted, the first container in the pod will be chosen")
 	// TODO. Add option to dump the generated nginx.conf configuration (maybe something like -o nginx.conf)
+	// TODO. Implement verbose mode
 
 	o.configFlags.AddFlags(cmd.Flags())
 
@@ -171,6 +172,7 @@ func (o *NginxIngressControllerCheckerOptions) Run() error {
 		if err != nil {
 			return err
 		}
+		fmt.Fprint(o.Out, "deployment found: ", deploy.Name, "\n")
 
 		p = kube.NewDeploymentPodController(o.ctx, o.clientset, deploy)
 	case "daemonset", "ds":
@@ -178,6 +180,7 @@ func (o *NginxIngressControllerCheckerOptions) Run() error {
 		if err != nil {
 			return err
 		}
+		fmt.Fprint(o.Out, "daemonset found: ", daemonSet.Name, "\n")
 
 		p = kube.NewDaemonsetPodController(o.ctx, o.clientset, daemonSet)
 	}
@@ -200,60 +203,52 @@ func (o *NginxIngressControllerCheckerOptions) Run() error {
 }
 
 func (o *NginxIngressControllerCheckerOptions) checkConfigurationDrift(podList *v1.PodList) error {
-
 	// Map containing podName and nginx configuration
 	nginxConfigurationPerPod := make(map[string]string)
 
-	// Print pod names
+	fmt.Fprintf(o.Out, "downloading configuration...\n")
+
+	// channel to receive pod configuration
+	downloadResults := make(chan downloadResult, len(podList.Items))
+
+	// Invoke the goroutines to download the configuration
 	for _, pod := range podList.Items {
-
-		// Get the container from the list of containers in the pod
-		var container *v1.Container
-		if o.container != "" {
-			for _, c := range pod.Spec.Containers {
-				if c.Name == o.container {
-					container = &c
-					break
-				}
-			}
-		} else {
-			container = &pod.Spec.Containers[0]
-		}
-
-		// Fail if no container is found
-		if container == nil {
-			return errors.New("container not found")
-		}
-
-		// Here we will save the content of the nginx.conf file
-		nginxConfBuffer := bytes.NewBufferString("")
-
-		//Create a new PodExec for this pod
-		pe := kube.NewPodExec(&pod, o.restConfig, o.clientset, nil, nginxConfBuffer)
-
-		// Execute the cat command to actually get the nginx.conf file
-		stderr, err := pe.Exec(container.Name, []string{"cat", "/etc/nginx/nginx.conf"})
-		// Check if something went wrong
-		if len(stderr) != 0 {
-			return fmt.Errorf((string)(stderr))
-		}
-		if err != nil {
-			return err
-		}
-
-		// Trim lines, remove the line if starts with a #
-		lines := strings.Split(nginxConfBuffer.String(), "\n")
-		nginxConfigurationPerPod[pod.Name] = ""
-		for _, line := range lines {
-			if strings.HasPrefix(strings.TrimSpace(line), "#") {
-				continue
-			}
-			nginxConfigurationPerPod[pod.Name] += line + "\n"
-		}
+		go download(o.restConfig, o.clientset, &pod, o.container, downloadResults)
 	}
 
+	// Wait for the goroutines to finish
+	for _, pod := range podList.Items {
+		dr := <-downloadResults
+		if len(dr.stderr) != 0 {
+			return fmt.Errorf((string)(dr.stderr))
+		}
+		if dr.err != nil {
+			return dr.err
+		}
+		// TODO. Add to the verbose mode
+		// fmt.Fprintf(o.Out, "configuration downloaded for pod %v. Length: %v\n", pod.Name, len(dr.content))
+		nginxConfigurationPerPod[pod.Name] = dr.content
+	}
+
+	fmt.Fprintf(o.Out, "formatting nginx configuration files to avoid false positives...\n")
+
 	// Create a channel to receive the results from the goroutines
-	checkChannel := make(chan error)
+	formatChannel := make(chan string, len(nginxConfigurationPerPod))
+
+	// Invoke the goroutines to check the configuration drift
+	for _, podConfig := range nginxConfigurationPerPod {
+		go format(podConfig, formatChannel)
+	}
+
+	// Wait for the goroutines to finish
+	for podName := range nginxConfigurationPerPod {
+		nginxConfigurationPerPod[podName] = <-formatChannel
+	}
+
+	fmt.Fprintf(o.Out, "checking configuration drift...\n")
+
+	// Create a channel to receive the results from the goroutines
+	checkChannel := make(chan error, len(nginxConfigurationPerPod))
 
 	// Invoke the goroutines to check the configuration drift
 	for podName, podConfig := range nginxConfigurationPerPod {
@@ -268,7 +263,61 @@ func (o *NginxIngressControllerCheckerOptions) checkConfigurationDrift(podList *
 		}
 	}
 
+	fmt.Fprintf(o.Out, "no configuration drift detected.\n")
+
 	return nil
+}
+
+type downloadResult struct {
+	content string
+
+	err    error
+	stderr []byte
+}
+
+func download(restConfig *rest.Config, clientset *kubernetes.Clientset, pod *v1.Pod, containerName string, downloadChannel chan downloadResult) {
+	// Get the container from the list of containers in the pod
+	var container *v1.Container
+	if containerName != "" {
+		for _, c := range pod.Spec.Containers {
+			if c.Name == containerName {
+				container = &c
+				break
+			}
+		}
+	} else {
+		container = &pod.Spec.Containers[0]
+	}
+
+	// Fail if no container is found
+	if container == nil {
+		downloadChannel <- downloadResult{
+			content: "",
+			err:     errors.New("container not found"),
+			stderr:  nil,
+		}
+	} else {
+		// Here we will save the content of the nginx.conf file
+		nginxConfBuffer := bytes.NewBufferString("")
+
+		//Create a new PodExec for this pod
+		pe := kube.NewPodExec(pod, restConfig, clientset, nil, nginxConfBuffer)
+
+		// Execute the cat command to actually get the nginx.conf file
+		stderr, err := pe.Exec(container.Name, []string{"cat", "/etc/nginx/nginx.conf"})
+
+		downloadChannel <- downloadResult{
+			content: nginxConfBuffer.String(),
+			err:     err,
+			stderr:  stderr,
+		}
+	}
+}
+
+func format(nginxConf string, formatChannel chan string) {
+	reg := regexp.MustCompile(`(?m)(^[\t]+#|^#).*`)
+	fortmattedNginxConf := reg.ReplaceAllString(nginxConf, "")
+	formatChannel <- fortmattedNginxConf
 }
 
 func check(podName string, nginxConfiguration string, nginxConfigurationPerPod map[string]string, checkChannel chan error) {
